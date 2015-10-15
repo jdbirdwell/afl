@@ -44,6 +44,7 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <dlfcn.h>
+#include <netdb.h>
 
 #include <sys/wait.h>
 #include <sys/time.h>
@@ -54,6 +55,9 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/file.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <sys/sendfile.h>
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
@@ -186,6 +190,29 @@ static u64 total_bitmap_size,         /* Total bit count for all bitmaps  */
 static u32 cpu_core_count;            /* CPU core count                   */
 
 static FILE* plot_file;               /* Gnuplot output file              */
+
+/* Globals for network support */
+
+static struct addrinfo *N_results = NULL, /* for results from getaddrinfo() */
+                       *N_rp = NULL;      /* to iterate through N_results[] */
+
+static struct sockaddr_storage N_myaddr; /* to hold send port info        */
+static struct sockaddr_storage N_server_addr; /* and server (send side)   */
+static socklen_t N_myaddrlen = sizeof (struct sockaddr_storage);
+                                      /* and length of both               */
+
+static u32 N_option_specified = 0;    /* 1 if a -N option is present      */
+static u8* N_option_string = 0;       /* points to copy of -N option str  */
+static u32 N_slen = 0;                /* length of the -N option string   */
+static u32 N_valid = 0;               /* 1 if valid URL option to -N      */
+static u32 N_fuzz_client = 0;         /* 1 if target is a network client  */
+static u32 N_myaddr_valid = 0;        /* use established conn or addr     */
+static s32 N_fd;                      /* for network file descriptor      */
+
+static u32 N_timeout_given = 0;       /* use delay before network I/O     */
+static u32 N_exec_tmout = 0;          /* network I/O delay in msec        */
+static struct timespec N_it;          /* structure for nanosleep() call   */
+
 
 struct queue_entry {
 
@@ -1798,6 +1825,511 @@ static void destroy_extras(void) {
 
 }
 
+/* Code to fuzz targets across localhost/127.0.0.1/::1 network interface
+ * 
+ * The network fuzzing code operates in each of two modes depending upon
+ * the type of target:
+ * 
+ * (1) as a "listener" or "server" to fuzz targets that send a request to 
+ *     another process and expect a response.  These targets are called
+ *     "clients". The relevant functions are network_setup_listener(),
+ *     which creates a socket and binds that socket to a (local) port
+ *     specified on the command line, and network_listen(), which expects
+ *     to receive a packet (UDP) or stream of data (TCP) from the target
+ *     and sends a fuzzed response.  This mode is selected using the -L
+ *     command line option, together with the -N command line option.
+ * 
+ * (2) as a "client" to fuzz targets that expect to receive a request from
+ *     another process.  These targets are called "servers" or "daemons".
+ *     The relevant function is network_send(), which sends a fuzzed
+ *     packet (UDP) or stream of data (TCP) to the target.  This mode is
+ *     selected using the -N command line option without the -L command
+ *     line option.
+ * 
+ *  */
+
+void network_setup_listener(void) {
+  /* exit if getaddrinfo() did not return address information structures
+   * that match the specification on the command line */
+  if (N_results != NULL) {
+    /* two cases: SOCK_STREAM (for TCP) and SOCK_DGRAM (for UDP) */
+    if (N_results->ai_socktype == SOCK_STREAM) {
+      /* TCP (stream) and connections are used.
+       * 
+       * A connection must be established from the target each 
+       * time network_listen() is called, and closed after the data are 
+       * transfered.  network_setup_listener() creates a stream socket
+       * (with the file descriptor N_fd) and listens for connection requests.  
+       * This must be done before a target that expects to connect is executed.
+       * N_myaddr_valid tells the codes that the listening socket has been
+       * setup (and keeps this code from running twice as a safety net). 
+       * UDP is connectionless and quite different. See below.
+       * 
+       * Local variables: */
+      int optval = 1;
+      if (N_myaddr_valid == 0) { /* don't do this twice! */
+        /* Find the first address that works and use it. */
+        for (N_rp = N_results; N_rp != NULL; N_rp = N_rp->ai_next) {
+          /* create the socket, skipping to the next addrinfo object on failure */
+          N_fd = socket(N_rp->ai_family, N_rp->ai_socktype, N_rp->ai_protocol);
+          if (N_fd == -1) {
+            close(N_fd);
+            continue;
+          }
+          /* set the socket option to reuse both the address and port */
+          if (setsockopt(N_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &optval,
+                  sizeof (optval)) == -1) {
+            close(N_fd);
+            PFATAL("failed to set socket option (TCP case)");
+          }
+          /* if bind() succeeds, we have found an address that works */
+          if (bind(N_fd, N_rp->ai_addr, N_rp->ai_addrlen) != -1) {
+            break;
+          }
+          close(N_fd);
+        }
+        /* if none is found, the user needs to examine the argument list */
+        if (N_rp == NULL) {
+          FATAL("failed to bind socket");
+        }
+        /* listen for connection attempts.  this can fail if another process
+         * is listening to the same port and address */
+        if (listen(N_fd, 8) == -1) PFATAL("listen() failed");
+        /* indicate that the socket has been created & bound to a port, and
+         * that the process is listening for connection attempts. */
+        N_myaddr_valid = 1;
+      }
+    } else if (N_results->ai_socktype == SOCK_DGRAM) {
+      /* UDP datagrams are used.
+       * 
+       * Create a socket to be used to both receive and send packets, referenced
+       * by the file descriptor N_fd.
+       * 
+       * N_fd is kept open for the duration of the afl run (closed on exit)
+       * and reused.  N_myaddr_valid signals the code that the UDP socket 
+       * has been set up and bound to the sending side of the address & port.
+       * 
+       * First time: find the appropriate sockaddr structure to be used and
+       * set up the sending side's socket. After the first time's successful
+       * execution, N_rp points to the address information corresonding to
+       * the sending side's socket information.
+       *
+       * Local variables:
+       */
+    int optval = 1;
+    if (N_myaddr_valid == 0) {
+        for (N_rp = N_results; N_rp != NULL; N_rp = N_rp->ai_next) {
+          /* create the socket, skipping to the next addrinfo object on failure */
+          N_fd = socket(N_rp->ai_family, N_rp->ai_socktype, N_rp->ai_protocol);
+          if (N_fd == -1) {
+            fprintf(stderr, "socket() call failed\n");
+            close(N_fd);
+            continue;
+          }
+          /* set the socket option to reuse both the address and port */
+          if (setsockopt(N_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &optval,
+                  sizeof (optval)) == -1) {
+            close(N_fd);
+            PFATAL("failed to set socket option (TCP case)");
+          }
+          /* if bind() succeeds, we have found an address that works */
+          if (bind(N_fd, N_rp->ai_addr, N_rp->ai_addrlen) != -1) {
+            break;
+          }
+          close(N_fd);
+        }
+        /* if none is found, the user needs to examine the argument list */
+        if (N_rp == NULL) {
+          FATAL("failed to bind socket");
+        }
+        /* indicate that the socket has been created & bound to a port, and
+         * that the process is listening for connection attempts. */
+        N_myaddr_valid = 1;
+      }
+    }
+  } else {
+    /* getaddrinfo() failed to return results matching the spec on the
+     * command line.  */
+    FATAL("no matching results from getaddrinfo()");
+  }
+}
+
+int network_listen(void) {
+  /* This function receives data from the target process, and then sends
+   * fuzzed data back to it.  There are two cases:
+   *
+   * (1) TCP (streams): a connection attempt from the target process is
+   *     solicited.  When the connection has been established, all available
+   *     data are read using non-blocking I/O, and then fuzzed data are
+   *     written.
+   *
+   * (2) UDP (datagrams/packets): all available packets are read using
+   *     non-blocking I/O, and then fuzzed data are written.
+   *
+   * In both cases, all data read are discarded.  Note that for UDP reads
+   * any data in excess of the size of the read buffer are discarded by the
+   * network stack.
+   * 
+   * Note that non-blocking reads are attempted, and if they fail then the
+   * calling process is expected to wait for a programmed interval of time
+   * (specified by the -D command line argument) and retry the call to
+   * network_listen(), for a programmed number of times (not user-selectable).
+   * 
+   * Note that unlike the case where this code plays the role of a client to
+   * the target process (using network_send()), we typically have no control
+   * over the target's reuse (or not) of ephemeral port numbers.  Therefore,
+   * we are at the mercy of the network stack's ability to scavenge available
+   * port numbers.  A recent Linux kernel appears to do this quite well;
+   * other operating systems may not.
+   *
+   * Local variables:
+   */
+  u32 MAXRECVBUFSIZE = 512;
+  u8 recvbuf[MAXRECVBUFSIZE];
+  s32 currreadlen, client_fd, fd, o;
+  /* network_setup_listener() must be called first, and must succeed */
+  if (!N_myaddr_valid)
+    FATAL("error: network_listen() called before network_setup_listener()");
+  
+  /* Two cases: SOCK_STREAM (for TCP) and SOCK_DGRAM (for UDP) */
+  if (N_rp->ai_socktype == SOCK_STREAM) {
+    /* TCP (stream) and connections are used. */
+    /* accept a connection if the client is ready, but don't block */
+    client_fd = accept4(N_fd, (struct sockaddr *) &N_myaddr,
+            &N_myaddrlen, SOCK_CLOEXEC | SOCK_NONBLOCK);
+    if (client_fd == -1) {
+      if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+        return -1; /* return to calling program, which will delay before retrying */
+      } else { /* a serous error occurred */
+        PFATAL("accept4() returned error other than EAGAIN or EWOULDBLOCK");
+      }
+    }
+    /* read whatever the client sends and throw it away, resetting
+     * non-blocking mode first (because some UNIXs propagate it to
+     * the returned client_fd) */
+    o = fcntl(client_fd, F_GETFL);
+    if (o >= 0) {
+      o = o & (~O_NONBLOCK);
+      if (fcntl(client_fd, F_SETFL, o) < 0) {
+        PFATAL("failed to reset non-blocking flag on client file descriptor (TCP)");
+      }
+    }
+    while ((currreadlen = recv(client_fd,recvbuf,MAXRECVBUFSIZE,MSG_DONTWAIT)) > 0);
+    if ((currreadlen <= 0) && (errno != EAGAIN) && (errno != EWOULDBLOCK)) {
+      PFATAL("read error");
+    }
+    /* duplicate the file descriptor used for the fuzzed data, and use the new
+     * file descriptor to read that data and send it to the target process */
+    fd = dup(out_fd);
+    struct stat statbuf;
+    /* stat the file descriptor to obtain the size of the data to be sent */
+    if (fstat(fd, &statbuf) == -1) {
+      PFATAL("failed to obtain stat for output file to target");
+    }
+    /* seek to the beginning of the file */
+    lseek(fd, 0, SEEK_SET);
+    /* use sendfile() to transfer the data if possible because it is efficient */
+    if (sendfile(client_fd, fd, NULL, statbuf.st_size) == -1) {
+      /* if sendfile() didn't work, use read() and write() via a buffer */
+      lseek(fd, 0, SEEK_SET); /* reset to the beginning of the file */
+      u8 tempbuf[512];
+      u32 kread;
+      while ((kread = read(fd, tempbuf, 512)) > 0) {
+        if (write(client_fd, tempbuf, kread) != kread) {
+          PFATAL("file copy to network socket failed (TCP)");
+        }
+      }
+    }
+    /* leave a clean campsite (as we found it) */
+    lseek(fd, 0, SEEK_SET);
+    close(fd);
+    /* and close the file descriptor of the socket for the target */
+    close(client_fd);
+    
+  } else if (N_rp->ai_socktype == SOCK_DGRAM) {
+    /* UDP datagrams are used.
+     *
+     * N_fd is kept open for the duration of the afl run (closed on exit)
+     * and reused.  N_myaddr_valid signals this code that the UDP socket
+     * has been set up and bound to the sending side of the address & port.
+     * N_rp points to the address information used for the socket.
+     *
+     * Local variables:
+     */
+    struct stat statbuf;
+    struct sockaddr_storage clientaddr;
+    u32 clientaddrlen = sizeof (struct sockaddr_storage);
+    /* read all available packets from the socket using non-blocking I/O */
+    {
+      int received_one = 0;
+      while ((currreadlen = recvfrom(N_fd, recvbuf, MAXRECVBUFSIZE, MSG_DONTWAIT,
+              (struct sockaddr *) &clientaddr, &clientaddrlen)) > 0) {
+        received_one = 1;
+      }
+      /* at least one is necessary; otherwise, return & calling program may
+       * wait and then try again */
+      if (!received_one) {
+        if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+          return -1;
+        } else {
+          /* any other error signals imply a serious problem exists */
+          PFATAL("read error");
+        }
+      }
+   }
+    /* duplicate the file descriptor used for the fuzzed data, and use the new
+     * file descriptor to read that data and send it to the target process */
+    fd = dup(out_fd);
+    /* stat the file descriptor to obtain the size of the data to be sent */
+    if (fstat(fd, &statbuf) == -1) PFATAL("fstat()failed");
+    /* seek to the beginning of the file and create a temporary buffer to
+     * hold all of the data in the file */
+    lseek(fd, 0, SEEK_SET);
+    u8 tempbuf[statbuf.st_size];
+    /* read the entire file into the buffer */
+    if (read(fd, tempbuf, statbuf.st_size) != statbuf.st_size)
+      PFATAL("read of outfile's content failed to return expected # of bytes");
+    /* and send the buffer's content to the target process.  Note that this
+     * code assumes that the entire buffer can be sent in a single packet.  If
+     * it can not (giant packet), the user may be doing something wrong.  */
+    if (sendto(N_fd, tempbuf, statbuf.st_size, 0,
+            (struct sockaddr *)&clientaddr,
+            clientaddrlen) < 0) {
+      PFATAL("partial or failed UDP write");
+    }
+    /* leave a clean campsite (as we found it) */
+    lseek(fd, 0, SEEK_SET);
+    close(fd);
+  }
+  return 0;
+}
+
+int network_send(void) {
+  /* This function sends fuzzed data to a target process.  There are two cases:
+   *
+   * (1) TCP (streams): a connection to the target process is attempted.
+   *     When the connection has been established, the fuzzed data are
+   *     written.
+   *
+   * (2) UDP (datagrams/packets): The fuzzed data are written.
+   *
+   * N_results should never be a NULL pointer because the return code
+   * from getaddrinfo() is checked. */
+  if (N_results != NULL) {
+    
+    /* Two cases: SOCK_STREAM (for TCP) and SOCK_DGRAM (for UDP) */
+    if (N_results->ai_socktype == SOCK_STREAM) {
+      /* TCP (stream) and connections are used.
+       * 
+       * NOTE: A TCP connection must be established each time this code
+       * is called, and closed after the data are transfered.  However, the
+       * same port number should be used for the sending (this) side of the
+       * TCP transaction every time.  Otherwise, ephemeral port
+       * numbers might be exhausted because of TCP's TIME_WAIT timeout
+       * interval.  N_myaddr_valid tells this code that the sending side's
+       * address information has been stored in N_myaddr and is to be reused. 
+       * UDP is connectionless and is therefore different. See below.
+       * 
+       * Note that the other mode of operation, where this code acts as a
+       * server to a target, does not have control over the target's reuse
+       * of ephemeral port numbers.  See the comments in network_listen()
+       * for a discussion.
+       * 
+       * Note that "soft" failures cause a return with an error code of -1. The
+       * calling process is expected to wait for a programmed interval of time
+       * (specified by the -D command line argument) and retry the call to
+       * network_send(), for a programmed number of times (not user-selectable)
+       * when this occurs.
+       * 
+       * Local variables: */
+      int optval = 1;
+
+      if (N_myaddr_valid == 0) {
+        /* First time: Find the correct address and use it, saving the info
+         * in M_myaddr for subsequent calls. */
+        for (N_rp = N_results; N_rp != NULL; N_rp = N_rp->ai_next) {
+          /* create a socket to connect to the target process */
+          N_fd = socket(N_rp->ai_family, N_rp->ai_socktype, N_rp->ai_protocol);
+          if (N_fd == -1) {
+            continue;
+          }
+          /* set the socket options to reuse both the address and port */
+          if (setsockopt(N_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &optval,
+                  sizeof (optval)) == -1) {
+            PFATAL("failed to set socket option (TCP case)");
+          }
+          /* attempt to connect to the target process, breaking out of the
+           * loop upon success */
+          if (connect(N_fd, N_rp->ai_addr, N_rp->ai_addrlen) != -1) {
+            break;
+          }
+          /* connect() failed, so close the file descriptor and try the
+           * next address information data structure */
+          close(N_fd);
+        }
+        if (N_rp == NULL) {
+          return -1; /* failed to connect; target process probably not ready */
+        }
+        /* obtain the send side socket information for re-use */
+        if (getsockname(N_fd, (struct sockaddr *) (&N_myaddr), &N_myaddrlen) == -1) {
+          PFATAL("unable to obtain local socket address information (TCP case)");
+        }
+        N_myaddr_valid = 1;
+      } else {
+        /* This is not the first time; reuse send side info in N_myaddr. */
+        N_fd = socket(N_rp->ai_family, N_rp->ai_socktype, N_rp->ai_protocol);
+        if (N_fd == -1) {
+          PFATAL("Subsequent attempt to create socket failed (TCP case)");
+        }
+        if (setsockopt(N_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &optval,
+                sizeof (optval)) == -1) {
+          PFATAL("Subsequent attempt to set socket option failed (TCP case)");
+        }
+        if (bind(N_fd, (struct sockaddr *) (&N_myaddr), N_myaddrlen) == -1) {
+          PFATAL("Attempt to bind socket to source address & port failed (TCP case)");
+        }
+        if (connect(N_fd, N_rp->ai_addr, N_rp->ai_addrlen) != -1) {
+        } else {
+          close(N_fd);
+          return -1; /* error returned from connect; target process not ready */
+        }
+      }
+
+      {
+        /* duplicate the file descriptor used for the fuzzed data, and use
+         * the new file descriptor to read that data and send it to the
+         * target process */
+        s32 fd = dup(out_fd);
+        /* stat the file descriptor to obtain the size of the data to be sent */
+        struct stat statbuf;
+        if (fstat(fd, &statbuf) == -1) PFATAL("fstat()failed");
+        /* seek to the beginning of the file */
+        lseek(fd, 0, SEEK_SET);
+        /* use sendfile() to transfer the data if possible because it is efficient */
+        if (sendfile(N_fd, fd, NULL, statbuf.st_size) == -1) {
+          /* if sendfile() didn't work, use read() and write() via a buffer */
+          lseek(fd, 0, SEEK_SET); /* reset to the beginning of the file */
+          /* create a temporary buffer to hold all of the data in the file */
+          u8 tempbuf[512];
+          u32 kread;
+          while ((kread = read(fd, tempbuf, 512)) > 0) {
+            if (write(N_fd, tempbuf, kread) != kread) {
+              PFATAL("file copy to network socket failed (TCP)");
+            }
+          }
+        }
+        /* leave a clean campsite (as we found it) */
+        lseek(fd, 0, SEEK_SET);
+        close(fd);
+      }
+      /* and close the connection to the target process, signaling EOF */
+      close(N_fd);
+      
+    } else if (N_results->ai_socktype == SOCK_DGRAM) {
+      /* UDP datagrams are used.
+       * 
+       * N_fd is kept open for the duration of the afl run (closed on exit)
+       * and reused.  N_myaddr_valid signals this code that the UDP socket
+       * has been set up and bound to the sending side of the address & port.
+       * N_rp points to the recipient side's address information after the
+       * first call. */
+
+      if (N_myaddr_valid == 0) {
+        /* First time: find the appropriate sockaddr structure to be used and
+         * set up the sending side's socket. After the first time's successful
+         * execution, N_myaddr holds the sending side's socket information,
+         * N_rp points to the socket address structure that was used to
+         * create the socket, and N_fd is a valid file descriptor for the
+         * socket. */
+        for (N_rp = N_results; N_rp != NULL; N_rp = N_rp->ai_next) {
+          if (!((N_rp->ai_family == AF_INET) || (N_rp->ai_family == AF_INET6))) {
+            continue;
+          }
+          /* create appropriate struct sockaddr according to ai_family */
+          if (N_rp->ai_family == AF_INET6) {
+            memset(&N_server_addr, 0, sizeof (struct sockaddr_in6));
+            N_server_addr.ss_family = AF_INET6;
+            ((struct sockaddr_in6 *) &N_server_addr)->sin6_family = AF_INET6;
+            ((struct sockaddr_in6 *) &N_server_addr)->sin6_addr = in6addr_any;
+            ((struct sockaddr_in6 *) &N_server_addr)->sin6_port = 0;
+          } else if (N_rp->ai_family == AF_INET) {
+            memset(&N_server_addr, 0, sizeof (struct sockaddr_in));
+            N_server_addr.ss_family = AF_INET;
+            ((struct sockaddr_in *) &N_server_addr)->sin_family = AF_INET;
+            ((struct sockaddr_in *) &N_server_addr)->sin_addr.s_addr = INADDR_ANY;
+            ((struct sockaddr_in *) &N_server_addr)->sin_port = 0;
+          } else {
+            FATAL("invalid ai_family (UDP case)");
+          }
+          /* create socket */
+          N_fd = socket(N_rp->ai_family, N_rp->ai_socktype, N_rp->ai_protocol);
+          if (N_fd == -1) {
+            continue;
+          }
+          /* bind to the address using an ephemeral port number */
+          if (bind(N_fd, (struct sockaddr *) &N_server_addr, sizeof (struct sockaddr_storage)) < 0) {
+            PFATAL("bind failed (UDP case)");
+          } else {
+            /* obtain the local port number that was assigned (for debugging) */
+            N_myaddrlen = sizeof (struct sockaddr_storage);
+            if (getsockname(N_fd, (struct sockaddr *) &N_myaddr, &N_myaddrlen) < 0) {
+              PFATAL("get socket name failed (UDP case)");
+            } else {
+              break;
+            }
+          } 
+          close(N_fd);
+        }
+        N_myaddr_valid = 1;
+      }
+      if (N_rp == NULL) {
+        return -1; /* failed to connect on any address (UDP case) */
+      }
+      {
+        /* duplicate the file descriptor used for the fuzzed data, and use
+         * the new file descriptor to read that data and send it to the
+         * target process */
+        s32 fd = dup(out_fd);
+        /* stat the file descriptor to obtain the size of the data to be sent */
+        struct stat statbuf;
+        if (fstat(fd, &statbuf) == -1) PFATAL("fstat()failed");
+        /* seek to the beginning of the file */
+        lseek(fd, 0, SEEK_SET);
+        /* create a temporary buffer to hold all of the data in the file */
+        u8 tempbuf[statbuf.st_size];
+        /* read the entire file into the buffer */
+        if (read(fd, tempbuf, statbuf.st_size) != statbuf.st_size) {
+          PFATAL("read of outfile's content failed to return expected # of bytes");
+        }
+        if (N_rp->ai_family == AF_INET) {
+          /* and send the buffer's content to the target process.  Note that
+           * this code assumes that the entire buffer can be sent in a single
+           * packet.  If it can not (giant packet), the user may be doing
+           * something wrong.  */
+          if (sendto(N_fd, tempbuf, statbuf.st_size, 0,
+                  (struct sockaddr *) ((N_rp)->ai_addr),
+                  sizeof (struct sockaddr_in)) < 0) {
+            PFATAL("partial or failed UDP write (IPv4)");
+          }
+        } else if (N_rp->ai_family == AF_INET6) {
+          if (sendto(N_fd, tempbuf, statbuf.st_size, 0,
+                  (struct sockaddr *) ((N_rp)->ai_addr),
+                  sizeof (struct sockaddr_in6)) < 0) {
+            PFATAL("partial or failed UDP write (IPv6)");
+          }
+        }
+        /* leave a clean campsite (as we found it) */
+        lseek(fd, 0, SEEK_SET);
+        close(fd);
+      }
+    }
+  } else {
+    /* this should never be executed */
+    FATAL("no address information structures match command line network spec");
+  }
+  
+  return 0;
+}
 
 /* Spin up fork server (instrumented mode only). The idea is explained here:
 
@@ -1872,7 +2404,7 @@ static void init_forkserver(char** argv) {
     dup2(dev_null_fd, 1);
     dup2(dev_null_fd, 2);
 
-    if (out_file) {
+    if (out_file || N_valid == 1) { /* no stdin for file or network input */
 
       dup2(dev_null_fd, 0);
 
@@ -2097,6 +2629,13 @@ static u8 run_target(char** argv) {
   u32 tb4;
 
   child_timed_out = 0;
+  
+  /* check to ensure that network listener has executed if doing network
+   * fuzzing of a client target (where the target writes to a socket first */
+  if (N_fuzz_client && !N_myaddr_valid) {
+    network_setup_listener();
+  }
+  
 
   /* After this memset, trace_bits[] are effectively volatile, so we
      must prevent any earlier operations from venturing into that
@@ -2148,7 +2687,7 @@ static u8 run_target(char** argv) {
       dup2(dev_null_fd, 1);
       dup2(dev_null_fd, 2);
 
-      if (out_file) {
+      if (out_file || N_valid == 1) { /* no stdin for file or network input */
 
         dup2(dev_null_fd, 0);
 
@@ -2210,6 +2749,30 @@ static u8 run_target(char** argv) {
 
   }
 
+  /* Write fuzzed data set to target using network if -N option is specified */
+  
+  if (N_valid) {
+    if (N_timeout_given) {
+      /* Network output to target process after specified delay, and try
+       * up to three times (hard-coded) */
+      N_it.tv_sec = (N_exec_tmout / 1000);
+      N_it.tv_nsec = (N_exec_tmout % 1000) * 1000000;
+      /* ignore errors & accept possibility that delay can be shorter */
+      {
+	u32 N_tries = 3;
+	nanosleep(&N_it, NULL);
+	/* attempt to send up to 3 times (because of target process startup time) */
+	while (N_tries-- &&
+               ((N_fuzz_client?network_listen():network_send()) == -1));
+      }
+    } else {
+      /* Network output to target process - no delay.  This usual won't work. */
+      if ((N_fuzz_client?network_listen():network_send()) == -1) {
+	FATAL("Network: failed to connect or send; specify a network delay time");
+      }
+    }
+  }
+  
   /* Configure timeout, as requested by user, then wait for child to terminate. */
 
   it.it_value.tv_sec = (exec_tmout / 1000);
@@ -6706,6 +7269,30 @@ static void usage(u8* argv0) {
        "Execution control settings:\n\n"
 
        "  -f file       - location read by the fuzzed program (stdin)\n"
+       "  -N URL        - fuzzed program is to read from a network port.\n"
+       "                  The network is specified by URL = type://path:port\n"
+       "                  where type= {udp|tcp}, path={::1|127.0.0.1|localhost},\n"
+       "                  and port is a port number or service name.\n"
+       "                  There are two cases, where the target program to be\n"
+       "                  fuzzed is either a server to afl-fuzz (the default)\n"
+       "                  or a client of afl-fuzz (using the -L option).  If the\n"
+       "                  target is a server, then afl-fuzz sends fuzzed data\n"
+       "                  to the address and port specified in the URL.  If\n"
+       "                  the target is a client, then afl-fuzz listens for\n"
+       "                  data on the specified port and responds by sending\n"
+       "                  fuzzed data to the (typically ephemeral) port used\n"
+       "                  by the target.  Note that the '+' is likely to be\n"
+       "                  necessary after the -t delay option for network\n"
+       "                  fuzzing.\n"
+       "  -D msec       - for network fuzzing only: delay in msec before\n"
+       "                  a network read/write/connection is attempted;\n"
+       "                  Note that 3 attempts are made, with this\n"
+       "                  delay between each (-t is still in effect)\n"
+       "  -L            - specify this option if the fuzzed program is a\n"
+       "                  network client (meaning it writes to the network\n"
+       "                  before reading (a fuzzed input) from the network.\n"
+       "                  The port is the port number to which the network\n"
+       "                  client is expected to write.\n"
        "  -t msec       - timeout for each run (auto-scaled, 50-%u ms)\n"
        "  -m megs       - memory limit for child process (%u MB)\n"
        "  -Q            - use binary-only instrumentation (QEMU mode)\n\n"     
@@ -7321,6 +7908,8 @@ static void save_cmdline(u32 argc, char** argv) {
 }
 
 
+
+
 /* Main entry point */
 
 int main(int argc, char** argv) {
@@ -7337,7 +7926,7 @@ int main(int argc, char** argv) {
 
   doc_path = access(DOC_PATH, F_OK) ? "docs" : DOC_PATH;
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Q")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:L")) > 0) {
 
     switch (opt) {
 
@@ -7487,12 +8076,219 @@ int main(int argc, char** argv) {
 
         break;
 
+      case 'N':
+
+        /* -N{network-path} : inject data to target via network connection
+         * 
+         * The network-path has the form "type://path:port" where
+         * 
+         * type is one of "udp", or "tcp",
+         * path is a host name or IP address (IPv4 or IPv6), and
+         * port is a port number or service name.
+         * 
+         * for the moment, make a copy of the -N option string and
+         * indicate that the -N option has been specified
+         * 
+         */
+
+        if (N_option_specified) FATAL("multiple -N options not allowed");
+        N_slen = strlen(optarg);
+        if (N_slen > 0) {
+          N_option_string = (u8*)ck_alloc(N_slen+1);
+          strcpy(N_option_string,optarg);
+          N_option_specified = 1;
+        } else {
+          FATAL("-N: missing argument");
+        }
+        break;
+
+      case 'D':
+        
+        if (N_timeout_given) FATAL("Multiple -D options not supported");
+        if (sscanf(optarg, "%u", &N_exec_tmout) < 1 ||
+                optarg[0] == '-') FATAL("Bad syntax used for -D");
+        N_timeout_given = 1;
+        break;
+
+      case 'L':
+        
+        if (N_fuzz_client) FATAL("Multiple -L options not supported");
+        N_fuzz_client = 1;
+        break;
+        
       default:
 
         usage(argv[0]);
 
     }
+  }
 
+  /* check for consistent use of network options (-N, -D, and -L) */
+  if (N_fuzz_client && !N_option_specified)
+    FATAL("-L (network client) option requires -N (network) option");
+  if (N_timeout_given && !N_option_specified)
+    FATAL("-D option can not be used without -N option");
+  
+  /* process network option(s), creating and configuring socket */
+  if (N_option_specified) {
+    
+    /* local variables (not needed later):      */
+    struct addrinfo N_hints; /* used for getaddrinfo() call */
+    /* These are all pointers used to process the -N network-path        */
+    u8  *N_found1 = 0,
+        *N_found2 = 0,
+        *N_pchar,
+        *N_type;
+    u8  *N_servicename = 0, /* ptr to start of servicename */
+        *N_hostspec = 0; /* ptr to start of hostname    */
+    
+    /* prepare (zero) addrinfo structure used for hints to getaddrinfo()*/
+    memset(&N_hints, 0, sizeof (struct addrinfo));
+    
+    /* process the -N option string -- two cases depending on N_fuzz_client */
+    if (N_fuzz_client) {
+      /* this is the case where afl-fuzz listens for the target to either
+       * connect and write (TCP) to afl-fuzz's socket or create a socket
+       * and send to (UDP) the afl-fuzz socket. */
+      N_found1 = strpbrk(N_option_string, "://");
+      if (!N_found1) {
+        FATAL("-N: invalid specification");
+      } else {
+        if (*N_found1 != ':')
+          FATAL("-N: first char after type must be ':'");
+        N_type = N_option_string;
+        *N_found1 = 0;
+        N_pchar = N_type;
+        while (*N_pchar != 0) {
+          *N_pchar = tolower(*N_pchar);
+          ++N_pchar;
+        }
+        if (strcmp(N_type, "tcp") == 0) {
+          N_hints.ai_flags = (AI_PASSIVE);
+          N_hints.ai_family = AF_UNSPEC;
+          N_hints.ai_socktype = SOCK_STREAM;
+        } else if (strcmp(N_type, "udp") == 0) {
+          N_hints.ai_flags = (AI_PASSIVE /* | AI_NUMERICSERV */); //COMMENTED OUT
+          N_hints.ai_family = AF_UNSPEC;
+          N_hints.ai_socktype = SOCK_DGRAM;
+        } else {
+          FATAL("-N: invalid type");
+        }
+      }
+
+      if ((N_found1 - N_option_string) >= N_slen)
+        FATAL("-N: incomplete specification");
+
+      /* find the port number */
+      N_found2 = strrchr(N_found1 + 1, ':');
+      if (!N_found2) {
+        FATAL("-N: TCP and UDP operation require a port number");
+      } else {
+        *N_found2 = 0;
+        if (*(N_found2 + 1) == 0) {
+          FATAL("-N: no port number or service name specified");
+        } else {
+          N_servicename = N_found2 + 1;
+        }
+      }
+
+      if ((strncmp(N_found1 + 1, "//", 2)) != 0) {
+        FATAL("-N: invalid network specification - malformed \"://\"");
+      } else {
+        *N_found1 = 0;
+        N_hostspec = N_found1 + 3;
+      }
+      if (!(
+              (strcmp("localhost", N_hostspec) == 0)
+              || (strcmp("::1", N_hostspec) == 0)
+              || (strcmp("127.0.0.1", N_hostspec) == 0)
+              )
+              ) FATAL("-N: only hosts allowed are localhost, ::1, and 127.0.0.1");
+
+      if (strcmp("localhost",N_hostspec) == 0) {
+        N_hints.ai_family = AF_UNSPEC;
+      } else if (strcmp("::1",N_hostspec) == 0) {
+        N_hints.ai_family = AF_INET6;
+      } else {
+        N_hints.ai_family = AF_INET;
+      }
+      if (getaddrinfo(N_hostspec, N_servicename, &N_hints, &N_results) != 0) {
+        FATAL("-N: getaddrinfo() lookup failed");
+      } else {
+        N_valid = 1;
+      }
+    } else {
+      /* This is the case where afl-fuzz either connects to the target
+       * and writes (TCP) or creates a socket and sends to the target (UDP). */
+      N_found1 = strpbrk(N_option_string, "://");
+      if (!N_found1) {
+        FATAL("-N: invalid specification");
+      } else {
+        if (*N_found1 != ':')
+          FATAL("-N: first char after type must be ':'");
+        N_type = N_option_string;
+        *N_found1 = 0;
+        N_pchar = N_type;
+        while (*N_pchar != 0) {
+          *N_pchar = tolower(*N_pchar);
+          ++N_pchar;
+        }
+        if (strcmp(N_type, "tcp") == 0) {
+          N_hints.ai_flags = (AI_V4MAPPED | AI_ADDRCONFIG);
+          N_hints.ai_family = AF_UNSPEC;
+          N_hints.ai_socktype = SOCK_STREAM;
+        } else if (strcmp(N_type, "udp") == 0) {
+          N_hints.ai_flags = (AI_V4MAPPED | AI_ADDRCONFIG);
+          N_hints.ai_family = AF_UNSPEC;
+          N_hints.ai_socktype = SOCK_DGRAM;
+        } else {
+          FATAL("-N: invalid type");
+        }
+      }
+
+      if ((N_found1 - N_option_string) >= N_slen)
+        FATAL("-N: incomplete specification");
+
+      if (N_hints.ai_family == AF_UNSPEC) { //redundant - for future use
+        /* TCP and UDP operation require a port number */
+        N_found2 = strrchr(N_found1 + 1, ':');
+        if (!N_found2) {
+          FATAL("-N: TCP and UDP operation require a port number");
+        } else {
+          *N_found2 = 0;
+          if (*(N_found2 + 1) == 0) {
+            FATAL("-N: no port number or service name specified");
+          } else {
+            N_servicename = N_found2 + 1;
+          }
+        }
+      }
+
+      if ((strncmp(N_found1 + 1, "//", 2)) != 0) {
+        FATAL("-N: invalid network specification - malformed \"://\"");
+      } else {
+        *N_found1 = 0;
+        N_hostspec = N_found1 + 3;
+      }
+      if (!(
+              (strcmp("localhost", N_hostspec) == 0)
+              || (strcmp("::1", N_hostspec) == 0)
+              || (strcmp("127.0.0.1", N_hostspec) == 0)
+              )
+              ) FATAL("-N: only hosts allowed are localhost, ::1, and 127.0.0.1");
+
+      if (N_hints.ai_family == AF_UNSPEC) {
+        if (getaddrinfo(N_hostspec, N_servicename, &N_hints, &N_results) != 0) {
+          FATAL(  "-N: getaddrinfo() lookup failed");
+        } else {
+          N_valid = 1;
+        }
+      }
+    }
+  }
+
+  //  exit(0); //TESTING
+    
   if (optind == argc || !in_dir || !out_dir) usage(argv[0]);
 
   setup_signal_handlers();

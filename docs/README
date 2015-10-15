@@ -179,6 +179,18 @@ $ ./afl-fuzz -i testcase_dir -o findings_dir /path/to/program @@
 You can also use the -f option to have the mutated data written to a specific
 file. This is useful if the program expects a particular file extension or so.
 
+For programs that accept input via a network, use:
+
+$ ./afl-fuzz -i testcase_dir -o findings_dir [-D delay_before_write] \
+             [-t timeout_delay] [-L ] -N network_specification /path/to/program \
+	     [...params...]
+
+where -L is specified only if the target program acts as a client to a network
+server (sends data to the server before receiving input in return).  Otherwise,
+afl-fuzz assumes the target program acts as a server or daemon and expects to
+receive data from network clients and respond.  The network_specification
+and the delay parameters are discussed below in (12).
+
 Non-instrumented binaries can be fuzzed in the QEMU mode (add -Q in the command
 line) or in a traditional, blind-fuzzer mode (specify -n).
 
@@ -255,6 +267,9 @@ Every instance of afl-fuzz takes up roughly one core. This means that on
 multi-core systems, parallelization is necessary to fully utilize the hardware.
 For tips on how to fuzz a common target on multiple cores or multiple networked
 machines, please refer to parallel_fuzzing.txt.
+
+Note the limitations to multi-core execution for fuzzing network services under
+(12).
 
 9) Fuzzer dictionaries
 ----------------------
@@ -353,7 +368,115 @@ tasks, fuzzing may put strain on your hardware and on the OS. In particular:
 
     $ iostat -d 3 -x -k [...optional disk ID...]
 
-12) Known limitations & areas for improvement
+12) Fuzzing network services
+----------------------------
+
+Both client and server (daemon) programs that communicate using an 
+IP network (IPv4 or IPv6) can be fuzzed using the command line
+
+$ ./afl-fuzz -i testcase_dir -o findings_dir [-D delay_before_write] \
+             [-t timeout_delay] [-L] -N network_specification /path/to/program \
+	     [...params...]
+
+where the network_specification has a form similar to a URL:
+
+    [tcp|udp]://hostspec:port
+
+Afl-fuzz has two network fuzzing modes, where it acts as a client to a
+network server that expects input via a socket (no -L option), and where it
+acts as a server to a network client that sends data to afl-fuzz before
+receiving input (using the -L option).  In the first case, afl-fuzz sends data
+to the port specified by the URL.  In the second case, afl-fuzz receives data
+on that port and sends a (fuzzed) response to the port the target (client) used
+to send its data.
+
+Note that when afl-fuzz acts as a server (the -L option), there is no control
+over how the target client manages its use of sockets - and in particular, a
+client that uses ephemeral sockets (the usual case) will rapidly consume the
+network stack's pool of available sockets.  Some operating systems are able to
+reclaim used ephemeral sockets to keep the pool from being exhausted; others
+may experience difficulties.
+
+While the -D and -t command line arguments are optional, they are almost
+always necessary when fuzzing a program using network protocols, as
+described below.
+
+Case is irrelevant in the network specification.  For programs that
+use a stream (connection-based) protocol, use TCP, and for programs
+that use a datagram (connectionless) protocol, use UDP.  The hostspec
+must be one of ::1 (forcing IPv6 networking), 127.0.0.1 (forcing IPv4
+networking), and localhost (which is typically configured as IPv4 but
+may suppport IPv6 on some systems).  Only loopback networking (local
+to the host) is supported.  The port must be either a port number in
+the range 1..65535 or a service name known to the system being used.
+You can test programs that use privileged ports, but you then have to
+provide afl-fuzz with those additional privileges (e.g., root).  It is
+usually better to reconfigure the program being tested so that it will
+use a non-privileged port during fuzzing.
+
+Programs that implement network services, also called daemons, are
+typically transaction-based: They wait for a request and send a
+response, and some expect a sequence of request/response transactions.
+Afl-fuzz implements fuzzing only for the first write to the target
+program and ignores all responses from the target.  Most network
+services expect to run as background processes and process requests
+from many processes -- they do not normally exit.  A timeout delay is
+required in order to terminate these processes, and the default
+timeout delay used in afl-fuzz is usually too long.  The user needs to
+experimentally determine a timeout delay (in milliseconds) that
+produces a sufficiently low percentage of hangs (exits forced by
+expiration of the delay) while allowing the input to the target from
+afl-fuzz to be completely processed.  (Note that afl-fuzz will usually
+count these hangs as a single unique hang.) Since a network service
+does not normally exit, the initial timing performed by afl-fuzz will
+fail unless a '+' character is appended to the timeout_delay
+parameter, indicating that afl-fuzz is to ignore these timeouts.
+
+Network services programs also require some time to perform start-up
+processing, create and bind a socket to an address and port, and begin
+listening for traffic on that socket.  Connection requests (TCP) and
+sends (UDP) generated by afl-fuzz will fail if made before the network
+service is ready.  Afl-fuzz implements a delay and retry procedure to
+avoid this problem, where the delay is specified by the
+delay_before_write parameter (in milliseconds).  The first connection
+attempt (for TCP) or write (for UDP) is not made until after this
+delay, and the delay also specifies the wait time before each
+subsequent attempt.  Afl-fuzz will attempt to connect or send to the
+same each target process a maximum of three times.
+
+The delay_before_write parameter, in particular, and to a lesser
+extent the timeout_delay parameter limit the maximum achievable rate
+of target program executions and therefore need to be small. A rule of
+thumb is the timeout_delay value should be slightly longer than three
+times the delay_before_write value, and the delay_before_write value
+should be as small as possible while consistent with an acceptable
+fraction of target process executions that time out (for example,
+around 0.1%).
+
+Network client program have similar characteristics that require the use of
+the delay parameter, but they write to their expected server (afl-fuzz in this
+case) before reading from their network socket.  This makes coordination between
+afl-fuzz and (client) target somewhat more challenging.  While the delay and
+timeout parameters can usually be adjusted to obtain execution rates similar
+to those for server programs, when afl-fuzz exits (due to a ^C interrupt) it
+may hang.  In this case, use (on UNIX or Linux) the ps command to find the
+process id (PID) of the afl-fuzz process, and use the kill command to terminate
+it (typically, "kill -9 PID").  This will also terminate (or scavenge) the
+network client program's process, which may be in a zombie state that can not
+otherwise be removed (without rebooting the system).
+
+A note concerning network fuzzing on multi-core systems:
+
+It is not possible to run two processes under a single operating
+system kernel that bind to (listen to) the same port on the same
+address. Thus, either a special wrapper (such as could be implemented
+using LD_PRELOAD) can be used to remap each target's port to a
+different value, or only one target process can be executed per kernel
+(not per core). Parallel fuzzing of network services can be done using
+several independent hosts (a cluster), or by reconfiguring the code
+running on each core to use a different port.
+
+13) Known limitations & areas for improvement
 ---------------------------------------------
 
 Here are some of the most important caveats for AFL:
@@ -377,11 +500,15 @@ Here are some of the most important caveats for AFL:
     isn't due to any specific fault of afl-fuzz; see notes_for_asan.txt for
     tips.
 
-  - There is no direct support for fuzzing network services, background
-    daemons, or interactive apps that require UI interaction to work. You may
-    need to make simple code changes to make them behave in a more traditional
-    way. Preeny may offer a relatively simple option, too - see:
-    https://github.com/zardus/preeny
+  - The supplied method for fuzzing network services or background daemons
+    is limited to fuzzing the first packet received by the service or daemon.
+    Since many of these processes are transactional, it may be desirable to
+    provide a deterministic sequence of transactions with the target,
+    followed by fuzzing. This is not supported and would be a nice topic
+    for future work. Interactive apps that require UI interaction to work
+    are also not supported. You may need to make simple code changes to
+    make them behave in a more traditional way. Preeny may offer a relatively
+    simple option, too - see: https://github.com/zardus/preeny
 
     Some useful tips for modifying network-based services can be also found at:
     https://www.fastly.com/blog/how-to-fuzz-server-american-fuzzy-lop
@@ -389,9 +516,14 @@ Here are some of the most important caveats for AFL:
   - AFL doesn't output human-readable coverage data. If you want to monitor
     coverage, use afl-cov from Michael Rash: https://github.com/mrash/afl-cov
 
+  - Only afl-fuzz implements network fuzzing capabilities at this time.  In
+    particular, afl-cmin (a script), afl-tmin, and afl-showmap, all of which
+    execute the target program, do not.
+
+
 Beyond this, see INSTALL for platform-specific tips.
 
-13) Special thanks
+14) Special thanks
 ------------------
 
 Many of the improvements to afl-fuzz wouldn't be possible without feedback,
@@ -424,11 +556,11 @@ bug reports, or patches from:
   rc0r                                  Jonathan Foote
   Christian Holler                      Dominique Pelle
   Jacek Wielemborek                     Leo Barnes
-  Jeremy Barnes
+  Jeremy Barnes                         Doug Birdwell
 
 Thank you!
 
-14) Contact
+15) Contact
 -----------
 
 Questions? Concerns? Bug reports? The author can be usually reached at
