@@ -13,8 +13,480 @@ Want to stay in the loop on major new features? Join our mailing list by
 sending a mail to <afl-users+subscribe@googlegroups.com>.
 
 Not sure if you should upgrade? The lowest currently recommended version
-is 1.92b. If you're stuck on an earlier release, it's strongly advisable
+is 2.31b. If you're stuck on an earlier release, it's strongly advisable
 to get on with the times.
+
+--------------
+Version 2.39b:
+--------------
+
+  - Improved error reporting in afl-cmin. Suggested by floyd.
+
+  - Made a minor tweak to trace-pc-guard support. Suggested by kcc.
+
+  - Added a mention of afl-monitor.
+
+--------------
+Version 2.38b:
+--------------
+
+  - Added -mllvm -sanitizer-coverage-block-threshold=0 to trace-pc-guard
+    mode, as suggested by Kostya Serebryany.
+
+--------------
+Version 2.37b:
+--------------
+
+  - Fixed a typo. Spotted by Jakub Wilk.
+
+  - Fixed support for make install when using trace-pc. Spotted by
+    Kurt Roeckx.
+
+  - Switched trace-pc to trace-pc-guard, which should be considerably
+    faster and is less quirky. Kudos to Konstantin Serebryany (and sorry
+    for dragging my feet).
+
+    Note that for some reason, this mode doesn't perform as well as
+    "vanilla" afl-clang-fast / afl-clang.
+
+--------------
+Version 2.36b:
+--------------
+
+  - Fixed a cosmetic bad free() bug when aborting -S sessions. Spotted
+    by Johannes S.
+
+  - Made a small change to afl-whatsup to sort fuzzers by name.
+
+  - Fixed a minor issue with malloc(0) in libdislocator. Spotted by
+    Rene Freingruber.
+
+  - Changed the clobber pattern in libdislocator to a slightly more
+    reliable one. Suggested by Rene Freingruber.
+
+  - Added a note about THP performance. Suggested by Sergey Davidoff.
+
+  - Added a somewhat unofficial support for running afl-tmin with a
+    baseline "mask" that causes it to minimize only for edges that
+    are unique to the input file, but not to the "boring" baseline.
+    Suggested by Sami Liedes.
+
+  - "Fixed" a getPassName() problem with never versions of clang.
+    Reported by Craig Young and several other folks.
+
+  Yep, I know I have a backlog on several other feature requests.
+  Stay tuned!
+
+--------------
+Version 2.35b:
+--------------
+
+  - Fixed a minor cmdline reporting glitch, spotted by Leo Barnes.
+
+  - Fixed a silly bug in libdislocator. Spotted by Johannes Schultz.
+
+--------------
+Version 2.34b:
+--------------
+
+  - Added a note about afl-tmin to technical_details.txt.
+
+  - Added support for AFL_NO_UI, as suggested by Leo Barnes.
+
+--------------
+Version 2.33b:
+--------------
+
+  - Added code to strip -Wl,-z,defs and -Wl,--no-undefined for afl-clang-fast,
+    since they interfere with -shared. Spotted and diagnosed by Toby Hutton.
+
+  - Added some fuzzing tips for Android.
+
+--------------
+Version 2.32b:
+--------------
+
+  - Added a check for AFL_HARDEN combined with AFL_USE_*SAN. Suggested by
+    Hanno Boeck.
+
+  - Made several other cosmetic adjustments to cycle timing in the wake of the
+    big tweak made in 2.31b.
+
+--------------
+Version 2.31b:
+--------------
+
+  - Changed havoc cycle counts for a marked performance boost, especially
+    with -S / -d. See the discussion of FidgetyAFL in:
+
+    https://groups.google.com/forum/#!topic/afl-users/fOPeb62FZUg
+
+    While this does not implement the approach proposed by the authors of
+    the CCS paper, the solution is a result of digging into that research;
+    more improvements may follow as I do more experiments and get more
+    definitive data.
+
+--------------
+Version 2.30b:
+--------------
+
+  - Made minor improvements to persistent mode to avoid the remote
+    possibility of "no instrumentation detected" issues with very low
+    instrumentation densities.
+
+  - Fixed a minor glitch with a leftover process in persistent mode.
+    Reported by Jakub Wilk and Daniel Stender.
+
+  - Made persistent mode bitmaps a bit more consistent and adjusted the way
+    this is shown in the UI, especially in persistent mode.
+
+--------------
+Version 2.29b:
+--------------
+
+  - Made a minor #include fix to llvm_mode. Suggested by Jonathan Metzman.
+
+  - Made cosmetic updates to the docs.
+
+--------------
+Version 2.28b:
+--------------
+
+  - Added "life pro tips" to docs/.
+
+  - Moved testcases/_extras/ to dictionaries/ for visibility.
+
+  - Made minor improvements to install scripts.
+
+  - Added an important safety tip.
+
+--------------
+Version 2.27b:
+--------------
+
+  - Added libtokencap, a simple feature to intercept strcmp / memcmp and
+    generate dictionary entries that can help extend coverage.
+
+  - Moved libdislocator to its own dir, added README.
+
+  - The demo in experimental/instrumented_cmp is no more.
+
+--------------
+Version 2.26b:
+--------------
+
+  - Made a fix for libdislocator.so to compile on MacOS X.
+
+  - Added support for DYLD_INSERT_LIBRARIES.
+
+  - Renamed AFL_LD_PRELOAD to AFL_PRELOAD.
+
+--------------
+Version 2.25b:
+--------------
+
+  - Made some cosmetic updates to libdislocator.so, renamed one env
+    variable.
+
+--------------
+Version 2.24b:
+--------------
+
+  - Added libdislocator.so, an experimental, abusive allocator. Try
+    it out with AFL_LD_PRELOAD=/path/to/libdislocator.so when running
+    afl-fuzz.
+
+--------------
+Version 2.23b:
+--------------
+
+  - Improved the stability metric for persistent mode binaries. Problem
+    spotted by Kurt Roeckx.
+
+  - Made a related improvement that may bring the metric to 100% for those
+    targets.
+
+--------------
+Version 2.22b:
+--------------
+
+  - Mentioned the potential conflicts between MSAN / ASAN and FORTIFY_SOURCE.
+    There is no automated check for this, since some distros may implicitly
+    set FORTIFY_SOURCE outside of the compiler's argv[].
+
+  - Populated the support for AFL_LD_PRELOAD to all companion tools.
+
+  - Made a change to the handling of ./afl-clang-fast -v. Spotted by
+    Jan Kneschke.
+
+--------------
+Version 2.21b:
+--------------
+
+  - Added some crash reporting notes for Solaris in docs/INSTALL, as
+    investigated by Martin Carpenter.
+
+  - Fixed a minor UI mix-up with havoc strategy stats.
+
+--------------
+Version 2.20b:
+--------------
+
+  - Revamped the handling of variable paths, replacing path count with a
+    "stability" score to give users a much better signal. Based on the
+    feedback from Vegard Nossum.
+
+  - Made a stability improvement to the syncing behavior with resuming
+    fuzzers. Based on the feedback from Vegard.
+
+  - Changed the UI to include current input bitmap density along with
+    total density. Ditto.
+
+  - Added experimental support for parallelizing -M.
+
+--------------
+Version 2.19b:
+--------------
+
+  - Made a fix to make sure that auto CPU binding happens at non-overlapping
+    times.
+
+--------------
+Version 2.18b:
+--------------
+
+  - Made several performance improvements to has_new_bits() and
+    classify_counts(). This should offer a robust performance bump with
+    fast targets.
+
+--------------
+Version 2.17b:
+--------------
+
+  - Killed the error-prone and manual -Z option. On Linux, AFL will now
+    automatically bind to the first free core (or complain if there are no
+    free cores left).
+
+  - Made some doc updates along these lines.
+
+--------------
+Version 2.16b:
+--------------
+
+  - Improved support for older versions of clang (hopefully without
+    breaking anything).
+
+  - Moved version data from Makefile to config.h. Suggested by
+    Jonathan Metzman.
+
+--------------
+Version 2.15b:
+--------------
+
+  - Added a README section on looking for non-crashing bugs.
+
+  - Added license data to several boring files. Contributed by
+    Jonathan Metzman.
+
+--------------
+Version 2.14b:
+--------------
+
+  - Added FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION as a macro defined when
+    compiling with afl-gcc and friends. Suggested by Kostya Serebryany.
+
+  - Refreshed some of the non-x86 docs.
+
+--------------
+Version 2.13b:
+--------------
+
+  - Fixed a spurious build test error with trace-pc and llvm_mode/Makefile.
+    Spotted by Markus Teufelberger.
+
+  - Fixed a cosmetic issue with afl-whatsup. Spotted by Brandon Perry.
+
+--------------
+Version 2.12b:
+--------------
+
+  - Fixed a minor issue in afl-tmin that can make alphabet minimization less
+    efficient during passes > 1. Spotted by Daniel Binderman.
+
+--------------
+Version 2.11b:
+--------------
+
+  - Fixed a minor typo in instrumented_cmp, spotted by Hanno Eissfeldt.
+
+  - Added a missing size check for deterministic insertion steps.
+
+  - Made an improvement to afl-gotcpu when -Z not used.
+
+  - Fixed a typo in post_library_png.so.c in experimental/. Spotted by Kostya
+    Serebryany.
+
+--------------
+Version 2.10b:
+--------------
+
+  - Fixed a minor core counting glitch, reported by Tyler Nighswander.
+
+--------------
+Version 2.09b:
+--------------
+
+  - Made several documentation updates.
+
+  - Added some visual indicators to promote and simplify the use of -Z.
+
+--------------
+Version 2.08b:
+--------------
+
+  - Added explicit support for -m32 and -m64 for llvm_mode. Inspired by
+    a request from Christian Holler.
+
+  - Added a new benchmarking option, as requested by Kostya Serebryany.
+
+--------------
+Version 2.07b:
+--------------
+
+  - Added CPU affinity option (-Z) on Linux. With some caution, this can
+    offer a significant (10%+) performance bump and reduce jitter.
+    Proposed by Austin Seipp.
+
+  - Updated afl-gotcpu to use CPU affinity where supported.
+
+  - Fixed confusing CPU_TARGET error messages with QEMU build. Spotted by
+    Daniel Komaromy and others.
+
+--------------
+Version 2.06b:
+--------------
+
+  - Worked around LLVM persistent mode hiccups with -shared code.
+    Contributed by Christian Holler.
+
+  - Added __AFL_COMPILER as a convenient way to detect that something is
+    built under afl-gcc / afl-clang / afl-clang-fast and enable custom
+    optimizations in your code. Suggested by Pedro Corte-Real.
+
+  - Upstreamed several minor changes developed by Franjo Ivancic to
+    allow AFL to be built as a library. This is fairly use-specific and
+    may have relatively little appeal to general audiences.
+
+--------------
+Version 2.05b:
+--------------
+
+  - Put __sanitizer_cov_module_init & co behind #ifdef to avoid problems
+    with ASAN. Spotted by Christian Holler.
+
+--------------
+Version 2.04b:
+--------------
+
+  - Removed indirect-calls coverage from -fsanitize-coverage (since it's
+    redundant). Spotted by Kostya Serebryany.
+
+--------------
+Version 2.03b:
+--------------
+
+  - Added experimental -fsanitize-coverage=trace-pc support that goes with
+    some recent additions to LLVM, as implemented by Kostya Serebryany.
+    Right now, this is cumbersome to use with common build systems, so
+    the mode remains undocumented.
+
+  - Made several substantial improvements to better support non-standard
+    map sizes in LLVM mode.
+
+  - Switched LLVM mode to thread-local execution tracing, which may offer
+    better results in some multithreaded apps.
+
+  - Fixed a minor typo, reported by Heiko Eissfeldt.
+
+  - Force-disabled symbolization for ASAN, as suggested by Christian Holler.
+
+  - AFL_NOX86 renamed to AFL_NO_X86 for consistency.
+
+  - Added AFL_LD_PRELOAD to allow LD_PRELOAD to be set for targets without
+    affecting AFL itself. Suggested by Daniel Godas-Lopez.
+
+--------------
+Version 2.02b:
+--------------
+
+  - Fixed a "lcamtuf can't count to 16" bug in the havoc stage. Reported
+    by Guillaume Endignoux.
+
+--------------
+Version 2.01b:
+--------------
+
+  - Made an improvement to cycle counter color coding, based on feedback
+    from Shai Sarfaty.
+
+  - Added a mention of aflize to sister_projects.txt.
+
+  - Fixed an installation issue with afl-as, as spotted by ilovezfs.
+
+--------------
+Version 2.00b:
+--------------
+
+  - Cleaned up color handling after a minor snafu in 1.99b (affecting some
+    terminals).
+
+  - Made minor updates to the documentation.
+
+--------------
+Version 1.99b:
+--------------
+
+  - Substantially revamped the output and the internal logic of afl-analyze.
+
+  - Cleaned up some of the color handling code and added support for
+    background colors.
+
+  - Removed some stray files (oops).
+
+  - Updated docs to better explain afl-analyze.
+
+--------------
+Version 1.98b:
+--------------
+
+  - Improved to "boring string" detection in afl-analyze.
+
+  - Added technical_details.txt for afl-analyze.
+
+--------------
+Version 1.97b:
+--------------
+
+  - Added afl-analyze, a nifty tool to analyze the structure of a file
+    based on the feedback from AFL instrumentation. This is kinda experimental,
+    so field reports welcome.
+
+  - Added a mention of afl-cygwin.
+
+  - Fixed a couple of typos, as reported by Jakub Wilk and others.
+
+--------------
+Version 1.96b:
+--------------
+
+  - Added -fpic to CFLAGS for the clang plugin, as suggested by Hanno Boeck.
+
+  - Made another clang change (IRBuilder) suggested by Jeff Trull.
+
+  - Fixed several typos, spotted by Jakub Wilk.
+
+  - Added support for AFL_SHUFFLE_QUEUE, based on discussions with
+    Christian Holler.
 
 --------------
 Version 1.95b:
@@ -1266,7 +1738,7 @@ Version 0.88b:
   - Refactored the code slightly to make more frequent updates to fuzzer_stats
     and to provide more detail about synchronization.
 
-  - Added a fflush(stdout) call for non-tty operation, as requested by 
+  - Added an fflush(stdout) call for non-tty operation, as requested by 
     Joonas Kuorilehto.
 
   - Added some detail to fuzzer_stats for parity with plot_file.

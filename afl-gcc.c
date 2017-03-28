@@ -116,7 +116,7 @@ static void edit_params(u32 argc, char** argv) {
   u8 m32_set = 0;
 #endif
 
-  cc_params = ck_alloc((argc + 16) * sizeof(u8*));
+  cc_params = ck_alloc((argc + 128) * sizeof(u8*));
 
   name = strrchr(argv[0], '/');
   if (!name) name = argv[0]; else name++;
@@ -229,17 +229,26 @@ static void edit_params(u32 argc, char** argv) {
 
   } else if (getenv("AFL_USE_ASAN")) {
 
-    cc_params[cc_par_cnt++] = "-fsanitize=address";
-
     if (getenv("AFL_USE_MSAN"))
       FATAL("ASAN and MSAN are mutually exclusive");
 
-  } else if (getenv("AFL_USE_MSAN")) {
+    if (getenv("AFL_HARDEN"))
+      FATAL("ASAN and AFL_HARDEN are mutually exclusive");
 
-    cc_params[cc_par_cnt++] = "-fsanitize=memory";
+    cc_params[cc_par_cnt++] = "-U_FORTIFY_SOURCE";
+    cc_params[cc_par_cnt++] = "-fsanitize=address";
+
+  } else if (getenv("AFL_USE_MSAN")) {
 
     if (getenv("AFL_USE_ASAN"))
       FATAL("ASAN and MSAN are mutually exclusive");
+
+    if (getenv("AFL_HARDEN"))
+      FATAL("MSAN and AFL_HARDEN are mutually exclusive");
+
+    cc_params[cc_par_cnt++] = "-U_FORTIFY_SOURCE";
+    cc_params[cc_par_cnt++] = "-fsanitize=memory";
+
 
   }
 
@@ -262,6 +271,22 @@ static void edit_params(u32 argc, char** argv) {
 
     cc_params[cc_par_cnt++] = "-O3";
     cc_params[cc_par_cnt++] = "-funroll-loops";
+
+    /* Two indicators that you're building for fuzzing; one of them is
+       AFL-specific, the other is shared with libfuzzer. */
+
+    cc_params[cc_par_cnt++] = "-D__AFL_COMPILER=1";
+    cc_params[cc_par_cnt++] = "-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION=1";
+
+  }
+
+  if (getenv("AFL_NO_BUILTIN")) {
+
+    cc_params[cc_par_cnt++] = "-fno-builtin-strcmp";
+    cc_params[cc_par_cnt++] = "-fno-builtin-strncmp";
+    cc_params[cc_par_cnt++] = "-fno-builtin-strcasecmp";
+    cc_params[cc_par_cnt++] = "-fno-builtin-strncasecmp";
+    cc_params[cc_par_cnt++] = "-fno-builtin-memcmp";
 
   }
 
@@ -297,7 +322,6 @@ int main(int argc, char** argv) {
     exit(1);
 
   }
-
 
   find_as(argv[0]);
 
