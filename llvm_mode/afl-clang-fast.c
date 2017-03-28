@@ -7,7 +7,7 @@
 
    LLVM integration design comes from Laszlo Szekeres.
 
-   Copyright 2015 Google Inc. All rights reserved.
+   Copyright 2015, 2016 Google Inc. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -96,10 +96,10 @@ static void find_obj(u8* argv0) {
 
 static void edit_params(u32 argc, char** argv) {
 
-  u8 fortify_set = 0, asan_set = 0, x_set = 0, maybe_linking = 1;
+  u8 fortify_set = 0, asan_set = 0, x_set = 0, maybe_linking = 1, bit_mode = 0;
   u8 *name;
 
-  cc_params = ck_alloc((argc + 64) * sizeof(u8*));
+  cc_params = ck_alloc((argc + 128) * sizeof(u8*));
 
   name = strrchr(argv[0], '/');
   if (!name) name = argv[0]; else name++;
@@ -112,28 +112,50 @@ static void edit_params(u32 argc, char** argv) {
     cc_params[0] = alt_cc ? alt_cc : (u8*)"clang";
   }
 
+  /* There are two ways to compile afl-clang-fast. In the traditional mode, we
+     use afl-llvm-pass.so to inject instrumentation. In the experimental
+     'trace-pc-guard' mode, we use native LLVM instrumentation callbacks
+     instead. The latter is a very recent addition - see:
+
+     http://clang.llvm.org/docs/SanitizerCoverage.html#tracing-pcs-with-guards */
+
+#ifdef USE_TRACE_PC
+  cc_params[cc_par_cnt++] = "-fsanitize-coverage=trace-pc-guard";
+  cc_params[cc_par_cnt++] = "-mllvm";
+  cc_params[cc_par_cnt++] = "-sanitizer-coverage-block-threshold=0";
+#else
   cc_params[cc_par_cnt++] = "-Xclang";
   cc_params[cc_par_cnt++] = "-load";
   cc_params[cc_par_cnt++] = "-Xclang";
   cc_params[cc_par_cnt++] = alloc_printf("%s/afl-llvm-pass.so", obj_path);
+#endif /* ^USE_TRACE_PC */
+
   cc_params[cc_par_cnt++] = "-Qunused-arguments";
+
+  /* Detect stray -v calls from ./configure scripts. */
+
+  if (argc == 1 && !strcmp(argv[1], "-v")) maybe_linking = 0;
 
   while (--argc) {
     u8* cur = *(++argv);
 
-#if defined(__x86_64__)
-    if (!strcmp(cur, "-m32")) FATAL("-m32 is not supported");
-#endif
+    if (!strcmp(cur, "-m32")) bit_mode = 32;
+    if (!strcmp(cur, "-m64")) bit_mode = 64;
 
     if (!strcmp(cur, "-x")) x_set = 1;
 
-    if (!strcmp(cur, "-c") || !strcmp(cur, "-S") || !strcmp(cur, "-E") ||
-        !strcmp(cur, "-v")) maybe_linking = 0;
+    if (!strcmp(cur, "-c") || !strcmp(cur, "-S") || !strcmp(cur, "-E"))
+      maybe_linking = 0;
 
     if (!strcmp(cur, "-fsanitize=address") ||
         !strcmp(cur, "-fsanitize=memory")) asan_set = 1;
 
     if (strstr(cur, "FORTIFY_SOURCE")) fortify_set = 1;
+
+    if (!strcmp(cur, "-shared")) maybe_linking = 0;
+
+    if (!strcmp(cur, "-Wl,-z,defs") ||
+        !strcmp(cur, "-Wl,--no-undefined")) continue;
 
     cc_params[cc_par_cnt++] = cur;
 
@@ -152,21 +174,36 @@ static void edit_params(u32 argc, char** argv) {
 
     if (getenv("AFL_USE_ASAN")) {
 
-      cc_params[cc_par_cnt++] = "-fsanitize=address";
-
       if (getenv("AFL_USE_MSAN"))
         FATAL("ASAN and MSAN are mutually exclusive");
 
-    } else if (getenv("AFL_USE_MSAN")) {
+      if (getenv("AFL_HARDEN"))
+        FATAL("ASAN and AFL_HARDEN are mutually exclusive");
 
-      cc_params[cc_par_cnt++] = "-fsanitize=memory";
+      cc_params[cc_par_cnt++] = "-U_FORTIFY_SOURCE";
+      cc_params[cc_par_cnt++] = "-fsanitize=address";
+
+    } else if (getenv("AFL_USE_MSAN")) {
 
       if (getenv("AFL_USE_ASAN"))
         FATAL("ASAN and MSAN are mutually exclusive");
 
+      if (getenv("AFL_HARDEN"))
+        FATAL("MSAN and AFL_HARDEN are mutually exclusive");
+
+      cc_params[cc_par_cnt++] = "-U_FORTIFY_SOURCE";
+      cc_params[cc_par_cnt++] = "-fsanitize=memory";
+
     }
 
   }
+
+#ifdef USE_TRACE_PC
+
+  if (getenv("AFL_INST_RATIO"))
+    FATAL("AFL_INST_RATIO not available at compile time with 'trace-pc'.");
+
+#endif /* USE_TRACE_PC */
 
   if (!getenv("AFL_DONT_OPTIMIZE")) {
 
@@ -176,7 +213,19 @@ static void edit_params(u32 argc, char** argv) {
 
   }
 
+  if (getenv("AFL_NO_BUILTIN")) {
+
+    cc_params[cc_par_cnt++] = "-fno-builtin-strcmp";
+    cc_params[cc_par_cnt++] = "-fno-builtin-strncmp";
+    cc_params[cc_par_cnt++] = "-fno-builtin-strcasecmp";
+    cc_params[cc_par_cnt++] = "-fno-builtin-strncasecmp";
+    cc_params[cc_par_cnt++] = "-fno-builtin-memcmp";
+
+  }
+
   cc_params[cc_par_cnt++] = "-D__AFL_HAVE_MANUAL_CONTROL=1";
+  cc_params[cc_par_cnt++] = "-D__AFL_COMPILER=1";
+  cc_params[cc_par_cnt++] = "-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION=1";
 
   /* When the user tries to use persistent or deferred forkserver modes by
      appending a single line to the program, we want to reliably inject a
@@ -202,8 +251,10 @@ static void edit_params(u32 argc, char** argv) {
     "({ static volatile char *_B __attribute__((used)); "
     " _B = (char*)\"" PERSIST_SIG "\"; "
 #ifdef __APPLE__
+    "__attribute__((visibility(\"default\"))) "
     "int _L(unsigned int) __asm__(\"___afl_persistent_loop\"); "
 #else
+    "__attribute__((visibility(\"default\"))) "
     "int _L(unsigned int) __asm__(\"__afl_persistent_loop\"); "
 #endif /* ^__APPLE__ */
     "_L(_A); })";
@@ -212,8 +263,10 @@ static void edit_params(u32 argc, char** argv) {
     "do { static volatile char *_A __attribute__((used)); "
     " _A = (char*)\"" DEFER_SIG "\"; "
 #ifdef __APPLE__
+    "__attribute__((visibility(\"default\"))) "
     "void _I(void) __asm__(\"___afl_manual_init\"); "
 #else
+    "__attribute__((visibility(\"default\"))) "
     "void _I(void) __asm__(\"__afl_manual_init\"); "
 #endif /* ^__APPLE__ */
     "_I(); } while (0)";
@@ -225,7 +278,29 @@ static void edit_params(u32 argc, char** argv) {
       cc_params[cc_par_cnt++] = "none";
     }
 
-    cc_params[cc_par_cnt++] = alloc_printf("%s/afl-llvm-rt.o", obj_path);
+    switch (bit_mode) {
+
+      case 0:
+        cc_params[cc_par_cnt++] = alloc_printf("%s/afl-llvm-rt.o", obj_path);
+        break;
+
+      case 32:
+        cc_params[cc_par_cnt++] = alloc_printf("%s/afl-llvm-rt-32.o", obj_path);
+
+        if (access(cc_params[cc_par_cnt - 1], R_OK))
+          FATAL("-m32 is not supported by your compiler");
+
+        break;
+
+      case 64:
+        cc_params[cc_par_cnt++] = alloc_printf("%s/afl-llvm-rt-64.o", obj_path);
+
+        if (access(cc_params[cc_par_cnt - 1], R_OK))
+          FATAL("-m64 is not supported by your compiler");
+
+        break;
+
+    }
 
   }
 
@@ -240,7 +315,11 @@ int main(int argc, char** argv) {
 
   if (isatty(2) && !getenv("AFL_QUIET")) {
 
+#ifdef USE_TRACE_PC
+    SAYF(cCYA "afl-clang-fast [tpcg] " cBRI VERSION  cRST " by <lszekeres@google.com>\n");
+#else
     SAYF(cCYA "afl-clang-fast " cBRI VERSION  cRST " by <lszekeres@google.com>\n");
+#endif /* ^USE_TRACE_PC */
 
   }
 

@@ -6,9 +6,9 @@ Sister projects
   designed for, or meant to integrate with AFL. See README for the general
   instruction manual.
 
-----------------------------
-Support for other languages:
-----------------------------
+-------------------------------------------
+Support for other languages / environments:
+-------------------------------------------
 
 Python AFL (Jakub Wilk)
 -----------------------
@@ -31,6 +31,14 @@ afl.rs (Keegan McAllister)
   Allows Rust features to be easily fuzzed with AFL (using the LLVM mode).
 
   https://github.com/kmcallister/afl.rs
+
+OCaml support (KC Sivaramakrishnan)
+-----------------------------------
+
+  Adds AFL-compatible instrumentation to OCaml programs.
+
+  https://github.com/ocamllabs/opam-repo-dev/pull/23
+  http://canopy.mirage.io/Posts/Fuzzing
 
 AFL for GCJ Java and other GCC frontends (-)
 --------------------------------------------
@@ -61,6 +69,21 @@ AFL fixup shim (Ben Nagy)
   that don't have C / .so bindings. Includes examples in Go.
 
   https://github.com/bnagy/aflfix
+
+TriforceAFL (Tim Newsham and Jesse Hertz)
+-----------------------------------------
+
+  Leverages QEMU full system emulation mode to allow AFL to target operating
+  systems and other alien worlds:
+
+  https://www.nccgroup.trust/us/about-us/newsroom-and-events/blog/2016/june/project-triforce-run-afl-on-everything/
+
+WinAFL (Ivan Fratric)
+---------------------
+
+  As the name implies, allows you to fuzz Windows binaries (using DynamoRio).
+
+  https://github.com/ivanfratric/winafl
 
 ----------------
 Network fuzzing:
@@ -125,9 +148,16 @@ afl-sid (Jacek Wielemborek)
 
   https://github.com/d33tah/afl-sid
 
--------------------------------------
-Crash triage, coverage analysis, etc:
--------------------------------------
+afl-monitor (Paul S. Ziegler)
+-----------------------------
+
+  Provides more detailed and versatile statistics about your running AFL jobs.
+
+  https://github.com/reflare/afl-monitor
+
+-----------------------------------------------------------
+Crash triage, coverage analysis, and other companion tools:
+-----------------------------------------------------------
 
 afl-crash-analyzer (Tobias Ospelt)
 ----------------------------------
@@ -150,6 +180,13 @@ afl-cov (Michael Rash)
 
   https://github.com/mrash/afl-cov
 
+afl-sancov (Bhargava Shastry)
+-----------------------------
+
+  Similar to afl-cov, but uses clang sanitizer instrumentation.
+
+  https://github.com/bshastry/afl-sancov
+
 RecidiVM (Jakub Wilk)
 ---------------------
 
@@ -157,9 +194,32 @@ RecidiVM (Jakub Wilk)
 
   http://jwilk.net/software/recidivm
 
+aflize (Jacek Wielemborek)
+--------------------------
+
+  Automatically build AFL-enabled versions of Debian packages.
+
+  https://github.com/d33tah/aflize
+
+afl-ddmin-mod (Markus Teufelberger)
+-----------------------------------
+
+  A variant of afl-tmin that uses a more sophisticated (but slower)
+  minimization algorithm.
+
+  https://github.com/MarkusTeufelberger/afl-ddmin-mod
+
 -------------------------------
 Narrow-purpose or experimental:
 -------------------------------
+
+Cygwin support (Ali Rizvi-Santiago)
+-----------------------------------
+
+  Pretty self-explanatory. As per the author, this "mostly" ports AFL to
+  Windows. Field reports welcome!
+
+  https://github.com/arizvisa/afl-cygwin
 
 Pause and resume scripts (Ben Nagy)
 -----------------------------------
@@ -225,3 +285,21 @@ Fuzzer shell for SQLite (Richard Hipp)
 
   http://www.sqlite.org/src/artifact/9e7e273da2030371
 
+Support for Python mutation modules (Christian Holler)
+------------------------------------------------------
+
+  https://github.com/choller/afl/blob/master/docs/mozilla/python_modules.txt
+
+Support for selective instrumentation (Christian Holler)
+--------------------------------------------------------
+
+  https://github.com/choller/afl/blob/master/docs/mozilla/partial_instrumentation.txt
+
+Kernel fuzzing (Dmitry Vyukov)
+------------------------------
+
+  A similar guided approach as applied to fuzzing syscalls:
+
+  https://github.com/google/syzkaller/wiki/Found-Bugs
+  https://github.com/dvyukov/linux/commit/33787098ffaaa83b8a7ccf519913ac5fd6125931
+  http://events.linuxfoundation.org/sites/events/files/slides/AFL%20filesystem%20fuzzing%2C%20Vault%202016_0.pdf

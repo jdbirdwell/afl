@@ -22,7 +22,9 @@ several interesting properties:
 
   - The instrumentation is CPU-independent. At least in principle, you should
     be able to rely on it to fuzz programs on non-x86 architectures (after
-    building afl-fuzz with AFL_NOX86=1).
+    building afl-fuzz with AFL_NO_X86=1).
+
+  - The instrumentation can cope a bit better with multi-threaded targets.
 
   - Because the feature relies on the internals of LLVM, it is clang-specific
     and will *not* work with GCC.
@@ -121,7 +123,7 @@ With the location selected, add this code in the appropriate spot:
 You don't need the #ifdef guards, but including them ensures that the program
 will keep working normally when compiled with a tool other than afl-clang-fast.
 
-Finally, recompile the pogram with afl-clang-fast (afl-gcc or afl-clang will
+Finally, recompile the program with afl-clang-fast (afl-gcc or afl-clang will
 *not* generate a deferred-initialization binary) - and you should be all set!
 
 5) Bonus feature #2: persistent mode
@@ -146,7 +148,9 @@ The basic structure of the program that does this would be:
 
 The numerical value specified within the loop controls the maximum number
 of iterations before AFL will restart the process from scratch. This minimizes
-the impact of memory leaks and similar glitches; 1000 is a good starting point.
+the impact of memory leaks and similar glitches; 1000 is a good starting point,
+and going much higher increases the likelihood of hiccups without giving you
+any real performance benefits.
 
 A more detailed template is shown in ../experimental/persistent_demo/.
 Similarly to the previous mode, the feature works only with afl-clang-fast;
@@ -157,12 +161,30 @@ do not fully reset the critical state, you may end up with false positives or
 waste a whole lot of CPU power doing nothing useful at all. Be particularly
 wary of memory leaks and of the state of file descriptors.
 
-When running in this mode, the execution paths will inherently vary a bit
-depending on whether the input loop is being entered for the first time or
-executed again. To avoid spurious warnings, the feature implies 
-AFL_NO_VAR_CHECK and hides the "variable path" warnings in the UI.
-
 PS. Because there are task switches still involved, the mode isn't as fast as
 "pure" in-process fuzzing offered, say, by LLVM's LibFuzzer; but it is a lot
 faster than the normal fork() model, and compared to in-process fuzzing,
 should be a lot more robust.
+
+6) Bonus feature #3: new 'trace-pc-guard' mode
+----------------------------------------------
+
+Recent versions of LLVM are shipping with a built-in execution tracing feature
+that provides AFL with the necessary tracing data without the need to
+post-process the assembly or install any compiler plugins. See:
+
+  http://clang.llvm.org/docs/SanitizerCoverage.html#tracing-pcs-with-guards
+
+As of this writing, the feature is only available on SVN trunk, and is yet to
+make it to an official release of LLVM. Nevertheless, if you have a
+sufficiently recent compiler and want to give it a try, build afl-clang-fast
+this way:
+
+  AFL_TRACE_PC=1 make clean all
+
+Note that this mode is currently about 20% slower than "vanilla" afl-clang-fast,
+and about 5-10% slower than afl-clang. This is likely because the
+instrumentation is not inlined, and instead involves a function call. On systems
+that support it, compiling your target with -flto should help.
+
+
