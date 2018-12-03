@@ -102,6 +102,7 @@ static u8  skip_deterministic,        /* Skip deterministic stages?       */
            no_var_check,              /* Don't detect variable behavior   */
            bitmap_changed = 1,        /* Time to update bitmap?           */
            qemu_mode,                 /* Running in QEMU mode?            */
+           quit_mode,                 /* Running in 'force quit' mode?    */
            skip_requested,            /* Skip request, via SIGUSR1        */
            run_over10m;               /* Run time over 10 minutes?        */
 
@@ -3097,6 +3098,9 @@ static void perform_dry_run(char** argv) {
         break;
 
       case FAULT_HANG:
+
+	if (quit_mode)
+	  break;
 
         if (timeout_given) {
 
@@ -7308,6 +7312,7 @@ static void usage(u8* argv0) {
 
        "  -d            - quick & dirty mode (skips deterministic steps)\n"
        "  -n            - fuzz without instrumentation (dumb mode)\n"
+       "  -q            - fuzz programs that do not quit by themselves (quit mode)\n"
        "  -x dir        - optional fuzzer dictionary (see README)\n\n"
 
        "Other stuff:\n\n"
@@ -7933,7 +7938,7 @@ int main(int argc, char** argv) {
 
   doc_path = access(DOC_PATH, F_OK) ? "docs" : DOC_PATH;
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:L")) > 0) {
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:qQN:D:L")) > 0) {
 
     switch (opt) {
 
@@ -8072,6 +8077,12 @@ int main(int argc, char** argv) {
 
         if (use_banner) FATAL("Multiple -T options not supported");
         use_banner = optarg;
+        break;
+
+      case 'q': /* force quit mode */
+
+	quit_mode = 1;
+
         break;
 
       case 'Q':
